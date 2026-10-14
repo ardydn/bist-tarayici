@@ -34,6 +34,7 @@ MIN_MCAP = 25_000_000_000   # piyasa degeri alt siniri (TL)
 RSI_LEVEL = 30.0            # RSI esigi
 ATR_MULT = 2.0              # ATR hedef carpani
 EXCLUDE = set()             # istemedigin hisseler, ornek: {"ISBTR"}
+NOTIFY_DOWN = True          # RSI 30'un altina inenleri de bildir (kapatmak icin False)
 MIN_ROWS = 50               # bundan az hisse gelirse veri bozuk say
 STALE_DAYS = 5              # kayitli RSI bu kadar gunden eskiyse kullanma
 KEEP_DAYS = 3               # bildirim kayitlarini kac gun sakla
@@ -92,6 +93,15 @@ def find_crosses(d: pd.DataFrame, prev_rsi: dict) -> pd.DataFrame:
     cross["atr_hedef"] = cross["close"] + ATR_MULT * cross["atr"]
     cross["key"] = cross["name"] + "|" + cross["rsi"].round(4).astype(str)
     return cross
+
+
+def find_down_crosses(d: pd.DataFrame, prev_rsi: dict) -> pd.DataFrame:
+    """RSI esigin altina inenler (onceki >= esik, simdiki < esik)."""
+    prev = d["name"].map(prev_rsi)
+    down = d[(prev >= RSI_LEVEL) & (d["rsi"] < RSI_LEVEL)].copy()
+    down["rsi_prev"] = prev[down.index]
+    down["key"] = "dn|" + down["name"] + "|" + down["rsi"].round(4).astype(str)
+    return down
 
 
 # ----------------------------------------------------------------------------
@@ -159,7 +169,7 @@ def build_message(r) -> str:
     hacim = "?" if pd.isna(r.volume) else f"{r.volume:,.0f}".replace(",", ".")
     bb = "?" if pd.isna(r.bb_upper) else f"{r.bb_upper:.2f}"
     return (
-        f"🟡 <b>{r.name}</b> — 1S mum kapandı, RSI 30'u yukarı kesti\n"
+        f"🟡 <b>{r.name}</b> — 1S mum kapandı, RSI {RSI_LEVEL:.0f}'u yukarı kesti\n"
         f"RSI: {r.rsi_prev:.1f} → {r.rsi:.1f}\n"
         f"M1 kapanış: {r.close:.2f} ({renk} mum)\n"
         f"M1 hacim: {hacim}\n"
@@ -169,6 +179,15 @@ def build_message(r) -> str:
         f"Sonraki saatte M2 onayına bak.\n"
         f"{link}"
     )
+
+
+def build_down_message(df: pd.DataFrame) -> str:
+    lines = [f"🔻 <b>RSI {RSI_LEVEL:.0f}'un altına inenler</b> (1S mum kapandı)", ""]
+    for r in df.itertuples():
+        lines.append(f"• <b>{r.name}</b> — RSI {r.rsi_prev:.1f} → {r.rsi:.1f} — {r.close:.2f}")
+    lines.append("")
+    lines.append("Yukarı kesişim için izleme listesine al.")
+    return "\n".join(lines)
 
 
 def build_summary(day: dict, now: datetime) -> str:
@@ -183,7 +202,19 @@ def build_summary(day: dict, now: datetime) -> str:
                 f"{c['rsi']:.1f} — {c['close']:.2f}"
             )
     else:
-        lines.append("Bugün 1S RSI'ı 30'u yukarı kesen hisse olmadı.")
+        lines.append(f"Bugün 1S RSI'ı {RSI_LEVEL:.0f}'u yukarı kesen hisse olmadı.")
+
+    if NOTIFY_DOWN:
+        downs = day.get("downs", [])
+        lines.append("")
+        if downs:
+            lines.append(f"RSI {RSI_LEVEL:.0f}'un altına inenler ({len(downs)}):")
+            for c in downs:
+                lines.append(
+                    f"• <b>{c['name']}</b> — {c['time']} — RSI {c['rsi_prev']:.1f} → {c['rsi']:.1f}"
+                )
+        else:
+            lines.append(f"Bugün RSI {RSI_LEVEL:.0f}'un altına inen hisse olmadı.")
 
     expected = [h for h in SCAN_HOURS if h <= now.hour]
     done = set(day["scans"])
@@ -242,6 +273,26 @@ def main(now: datetime = None) -> None:
             print("  gonderildi:", r.name)
         except Exception as e:  # gonderilemezse sonraki calismada tekrar denenir
             print("  GONDERILEMEDI:", r.name, repr(e))
+
+    if NOTIFY_DOWN:
+        downs = find_down_crosses(d, prev)
+        downs = downs[~downs["key"].isin(sent)]
+        if len(downs):
+            try:
+                send(build_down_message(downs))
+                for r in downs.itertuples():
+                    sent[r.key] = now.isoformat()
+                    day.setdefault("downs", []).append(
+                        {
+                            "name": r.name,
+                            "time": f"{now:%H:%M}",
+                            "rsi_prev": float(r.rsi_prev),
+                            "rsi": float(r.rsi),
+                        }
+                    )
+                print(f"  asagi kesen bildirimi gonderildi: {len(downs)} hisse")
+            except Exception as e:
+                print("  ASAGI KESEN BILDIRIMI GONDERILEMEDI:", repr(e))
 
     state["rsi"] = {n: float(v) for n, v in zip(d["name"], d["rsi"])}
     state["updated"] = now.isoformat()
