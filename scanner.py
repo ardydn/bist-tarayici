@@ -1,0 +1,201 @@
+"""
+BIST RSI-30 tarayici (1 saatlik mumlar) -> Telegram bildirimi
+
+Her saat basi (TradingView verisi ~15 dk gecikmeli oldugu icin :16'da) calisir.
+O an KAPANMIS son mumun RSI(14) degerine bakar ("RSI[1]").
+Bir onceki calismada kaydedilen RSI <= 30 iken simdiki RSI > 30 ise,
+yani kapanan mum RSI 30'u asagidan yukari kestiyse, Telegram'a mesaj atar.
+Hacim (VA 20) kontrolu manuel yapilir.
+
+Kullanim:
+    python scanner.py          # normal tarama
+    python scanner.py --test   # once Telegram'a test mesaji da gonderir
+Gerekli ortam degiskenleri: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+"""
+
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pandas as pd
+import requests
+from tradingview_screener import Query, col
+
+# ----------------------------------------------------------------------------
+# AYARLAR
+# ----------------------------------------------------------------------------
+MIN_MCAP = 25_000_000_000   # piyasa degeri alt siniri (TL)
+RSI_LEVEL = 30.0            # RSI esigi
+ATR_MULT = 2.0              # ATR hedef carpani
+EXCLUDE = set()             # istemedigin hisseler, ornek: {"ISBTR"}
+MIN_ROWS = 50               # bundan az hisse gelirse veri bozuk say
+STALE_DAYS = 5              # kayitli RSI bu kadar gunden eskiyse kullanma
+KEEP_DAYS = 3               # bildirim kayitlarini kac gun sakla
+STATE_FILE = Path("state.json")
+
+TZ_TR = timezone(timedelta(hours=3))
+
+
+# ----------------------------------------------------------------------------
+# VERI  ([1] = bir onceki, yani kapanmis mum)
+# ----------------------------------------------------------------------------
+def fetch() -> pd.DataFrame:
+    q = (
+        Query()
+        .set_markets("turkey")
+        .select(
+            "name",
+            "RSI[1]|60",
+            "open[1]|60",
+            "close[1]|60",
+            "ATR[1]|60",
+            "BB.upper[1]|60",
+            "volume[1]|60",
+        )
+        .where(col("market_cap_basic") > MIN_MCAP)
+        .order_by("market_cap_basic", ascending=False)
+        .limit(500)
+    )
+    _, df = q.get_scanner_data()
+    return df
+
+
+def prepare(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.rename(
+        columns={
+            "RSI[1]|60": "rsi",
+            "open[1]|60": "open",
+            "close[1]|60": "close",
+            "ATR[1]|60": "atr",
+            "BB.upper[1]|60": "bb_upper",
+            "volume[1]|60": "volume",
+        }
+    )
+    d = d.dropna(subset=["rsi", "close", "atr"])
+    d = d[d["rsi"] > 0]                                   # verisi bozuk hisseleri ele
+    d = d[~d["name"].isin(EXCLUDE)]
+    return d.reset_index(drop=True)
+
+
+def find_crosses(d: pd.DataFrame, prev_rsi: dict) -> pd.DataFrame:
+    prev = d["name"].map(prev_rsi)                        # kayit yoksa NaN -> False
+    cross = d[(prev <= RSI_LEVEL) & (d["rsi"] > RSI_LEVEL)].copy()
+    cross["rsi_prev"] = prev[cross.index]
+    cross["atr_hedef"] = cross["close"] + ATR_MULT * cross["atr"]
+    cross["key"] = cross["name"] + "|" + cross["rsi"].round(4).astype(str)
+    return cross
+
+
+# ----------------------------------------------------------------------------
+# DURUM (onceki RSI degerleri + tekrar bildirimi engeli)
+# ----------------------------------------------------------------------------
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    limit = datetime.now(TZ_TR) - timedelta(days=KEEP_DAYS)
+    state["sent"] = {
+        k: v for k, v in state.get("sent", {}).items()
+        if datetime.fromisoformat(v) > limit
+    }
+    STATE_FILE.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
+
+
+def previous_rsi(state: dict, now: datetime) -> dict:
+    try:
+        age = now - datetime.fromisoformat(state["updated"])
+        if age > timedelta(days=STALE_DAYS):
+            return {}
+        return state.get("rsi", {})
+    except Exception:
+        return {}
+
+
+# ----------------------------------------------------------------------------
+# TELEGRAM
+# ----------------------------------------------------------------------------
+def send(text: str) -> None:
+    token = os.environ["TELEGRAM_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    r = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def build_message(r) -> str:
+    link = f"https://www.tradingview.com/chart/?symbol=BIST:{r.name}"
+    if pd.isna(r.open):
+        renk = "?"
+    else:
+        renk = "yeşil" if r.close >= r.open else "kırmızı"
+    hacim = "?" if pd.isna(r.volume) else f"{r.volume:,.0f}".replace(",", ".")
+    bb = "?" if pd.isna(r.bb_upper) else f"{r.bb_upper:.2f}"
+    return (
+        f"🟡 <b>{r.name}</b> — 1S mum kapandı, RSI 30'u yukarı kesti\n"
+        f"RSI: {r.rsi_prev:.1f} → {r.rsi:.1f}\n"
+        f"M1 kapanış: {r.close:.2f} ({renk} mum)\n"
+        f"M1 hacim: {hacim}\n"
+        f"ATR(2x) hedef: {r.atr_hedef:.2f}\n"
+        f"Bollinger üst: {bb}\n\n"
+        f"Kontrol et: hacim barı yeşil ve VA(20) üstünde mi? "
+        f"Sonraki saatte M2 onayına bak.\n"
+        f"{link}"
+    )
+
+
+# ----------------------------------------------------------------------------
+# ANA AKIS
+# ----------------------------------------------------------------------------
+def main() -> None:
+    now = datetime.now(TZ_TR)
+    if "--test" in sys.argv:
+        send(f"✅ Tarayıcı çalışıyor. Test mesajı ({now:%d.%m.%Y %H:%M}).")
+
+    d = prepare(fetch())
+    if len(d) < MIN_ROWS:
+        print(f"HATA: sadece {len(d)} hisse geldi, veri bozuk gorunuyor. Durum guncellenmedi.")
+        sys.exit(1)
+
+    state = load_state()
+    prev = previous_rsi(state, now)
+    crosses = find_crosses(d, prev)
+
+    sent = state.setdefault("sent", {})
+    new = crosses[~crosses["key"].isin(sent)]
+
+    print(
+        f"[{now:%Y-%m-%d %H:%M}] taranan: {len(d)} | onceki kayit: {len(prev)} | "
+        f"kesisim: {len(crosses)} | yeni: {len(new)}"
+    )
+    if not prev:
+        print("  Not: onceki RSI kaydi yok (ilk calisma veya eski kayit), bu tur sinyal aranmadi.")
+
+    for r in new.itertuples():
+        try:
+            send(build_message(r))
+            sent[r.key] = now.isoformat()
+            print("  gonderildi:", r.name)
+        except Exception as e:  # gonderilemezse sonraki calismada tekrar denenir
+            print("  GONDERILEMEDI:", r.name, repr(e))
+
+    state["rsi"] = {n: float(v) for n, v in zip(d["name"], d["rsi"])}
+    state["updated"] = now.isoformat()
+    save_state(state)
+
+
+if __name__ == "__main__":
+    main()
