@@ -7,9 +7,13 @@ Bir onceki calismada kaydedilen RSI <= 30 iken simdiki RSI > 30 ise,
 yani kapanan mum RSI 30'u asagidan yukari kestiyse, Telegram'a mesaj atar.
 Hacim (VA 20) kontrolu manuel yapilir.
 
+Gun sonu (18:xx calismasi) o gunun ozetini de gonderir.
+
 Kullanim:
-    python scanner.py          # normal tarama
-    python scanner.py --test   # once Telegram'a test mesaji da gonderir
+    python scanner.py            # normal tarama
+    python scanner.py --test     # once Telegram'a test mesaji da gonderir
+    python scanner.py --summary  # ozeti simdi gonder (test icin)
+Ayni bayraklar RUN_TEST=true / RUN_SUMMARY=true ortam degiskenleriyle de verilebilir.
 Gerekli ortam degiskenleri: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 """
 
@@ -33,6 +37,8 @@ EXCLUDE = set()             # istemedigin hisseler, ornek: {"ISBTR"}
 MIN_ROWS = 50               # bundan az hisse gelirse veri bozuk say
 STALE_DAYS = 5              # kayitli RSI bu kadar gunden eskiyse kullanma
 KEEP_DAYS = 3               # bildirim kayitlarini kac gun sakla
+SCAN_HOURS = range(10, 19)  # beklenen tarama saatleri: 10:16 ... 18:16
+SUMMARY_HOUR = 18           # bu saatten sonraki ilk calismada gun ozeti gider
 STATE_FILE = Path("state.json")
 
 TZ_TR = timezone(timedelta(hours=3))
@@ -89,7 +95,7 @@ def find_crosses(d: pd.DataFrame, prev_rsi: dict) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
-# DURUM (onceki RSI degerleri + tekrar bildirimi engeli)
+# DURUM (onceki RSI degerleri, tekrar bildirimi engeli, gunluk kayit)
 # ----------------------------------------------------------------------------
 def load_state() -> dict:
     try:
@@ -115,6 +121,14 @@ def previous_rsi(state: dict, now: datetime) -> dict:
         return state.get("rsi", {})
     except Exception:
         return {}
+
+
+def today_log(state: dict, now: datetime) -> dict:
+    """Bugunun kaydi; gun degistiyse sifirlanir."""
+    date = now.strftime("%Y-%m-%d")
+    if state.get("today", {}).get("date") != date:
+        state["today"] = {"date": date, "scans": [], "crosses": []}
+    return state["today"]
 
 
 # ----------------------------------------------------------------------------
@@ -157,12 +171,39 @@ def build_message(r) -> str:
     )
 
 
+def build_summary(day: dict, now: datetime) -> str:
+    lines = [f"📋 <b>Günün özeti — {now:%d.%m.%Y}</b>", ""]
+
+    crosses = day["crosses"]
+    if crosses:
+        lines.append(f"RSI 30'u yukarı kesen hisseler ({len(crosses)}):")
+        for c in crosses:
+            lines.append(
+                f"• <b>{c['name']}</b> — {c['time']} — RSI {c['rsi_prev']:.1f} → "
+                f"{c['rsi']:.1f} — {c['close']:.2f}"
+            )
+    else:
+        lines.append("Bugün 1S RSI'ı 30'u yukarı kesen hisse olmadı.")
+
+    expected = [h for h in SCAN_HOURS if h <= now.hour]
+    done = set(day["scans"])
+    missing = [h for h in expected if h not in done]
+    lines.append("")
+    lines.append(f"Tarama: {len(expected) - len(missing)}/{len(expected)}")
+    if missing:
+        lines.append("Çalışmayan saatler: " + ", ".join(f"{h}:16" for h in missing))
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------------
 # ANA AKIS
 # ----------------------------------------------------------------------------
-def main() -> None:
-    now = datetime.now(TZ_TR)
-    if "--test" in sys.argv:
+def main(now: datetime = None) -> None:
+    now = now or datetime.now(TZ_TR)
+    want_test = "--test" in sys.argv or os.environ.get("RUN_TEST") == "true"
+    want_summary = "--summary" in sys.argv or os.environ.get("RUN_SUMMARY") == "true"
+
+    if want_test:
         send(f"✅ Tarayıcı çalışıyor. Test mesajı ({now:%d.%m.%Y %H:%M}).")
 
     d = prepare(fetch())
@@ -175,6 +216,7 @@ def main() -> None:
     crosses = find_crosses(d, prev)
 
     sent = state.setdefault("sent", {})
+    day = today_log(state, now)
     new = crosses[~crosses["key"].isin(sent)]
 
     print(
@@ -188,12 +230,33 @@ def main() -> None:
         try:
             send(build_message(r))
             sent[r.key] = now.isoformat()
+            day["crosses"].append(
+                {
+                    "name": r.name,
+                    "time": f"{now:%H:%M}",
+                    "rsi_prev": float(r.rsi_prev),
+                    "rsi": float(r.rsi),
+                    "close": float(r.close),
+                }
+            )
             print("  gonderildi:", r.name)
         except Exception as e:  # gonderilemezse sonraki calismada tekrar denenir
             print("  GONDERILEMEDI:", r.name, repr(e))
 
     state["rsi"] = {n: float(v) for n, v in zip(d["name"], d["rsi"])}
     state["updated"] = now.isoformat()
+    day["scans"].append(now.hour)
+
+    auto_summary = now.hour >= SUMMARY_HOUR and state.get("summary_date") != day["date"]
+    if want_summary or auto_summary:
+        try:
+            send(build_summary(day, now))
+            if auto_summary:
+                state["summary_date"] = day["date"]
+            print("  gun ozeti gonderildi")
+        except Exception as e:
+            print("  OZET GONDERILEMEDI:", repr(e))
+
     save_state(state)
 
 
