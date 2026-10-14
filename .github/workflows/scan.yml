@@ -11,6 +11,10 @@ on:
         description: "Telegram test mesaji da gonder"
         type: boolean
         default: true
+      summary:
+        description: "Gun ozetini simdi gonder (test)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,8 +42,9 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEST_FLAG: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '--test' || '' }}
-        run: python scanner.py $TEST_FLAG
+          RUN_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test }}
+          RUN_SUMMARY: ${{ github.event_name == 'workflow_dispatch' && inputs.summary }}
+        run: python scanner.py
 
       - name: Durum dosyasini kaydet
         run: |
