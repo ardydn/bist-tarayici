@@ -202,7 +202,7 @@ def build_summary(day: dict, now: datetime) -> str:
                 f"{c['rsi']:.1f} — {c['close']:.2f}"
             )
     else:
-        lines.append(f"Bugün 1S RSI'ı {RSI_LEVEL:.0f}'u yukarı kesen hisse olmadı.")
+        lines.append(f"Bugün RSI {RSI_LEVEL:.0f}'u yukarı kesen hisse olmadı.")
 
     if NOTIFY_DOWN:
         downs = day.get("downs", [])
