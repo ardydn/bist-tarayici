@@ -2,7 +2,7 @@ name: bist-rsi-tarayici
 
 on:
   schedule:
-    # Saatte bir, her saatin 16. dakikasinda (TradingView verisi ~15 dk gecikmeli). #deneme
+    # Saatte bir, her saatin 16. dakikasinda (TradingView verisi ~15 dk gecikmeli).
     # 07:16-15:16 UTC = 10:16-18:16 TSI, hafta ici
     - cron: "16 7-15 * * 1-5"
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       test:
         description: "Telegram test mesaji da gonder"
         type: boolean
-        default: true
+        default: false
       summary:
         description: "Gun ozetini simdi gonder (test)"
         type: boolean
