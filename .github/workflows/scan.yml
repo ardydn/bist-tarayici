@@ -2,7 +2,7 @@ name: bist-rsi-tarayici
 
 on:
   schedule:
-    # Saatte bir, her saatin 16. dakikasinda (TradingView verisi ~15 dk gecikmeli).
+    # Saatte bir, her saatin 16. dakikasinda (TradingView verisi ~15 dk gecikmeli). #deneme
     # 07:16-15:16 UTC = 10:16-18:16 TSI, hafta ici
     - cron: "16 7-15 * * 1-5"
   workflow_dispatch:
