@@ -2,9 +2,10 @@
 BIST RSI-30 tarayici (1 saatlik mumlar) -> Telegram bildirimi
 
 Her saat basi (TradingView verisi ~15 dk gecikmeli oldugu icin :16'da) calisir.
-O an KAPANMIS son mumun RSI(14) degerine bakar ("RSI[1]").
-Bir onceki calismada kaydedilen RSI <= 30 iken simdiki RSI > 30 ise,
-yani kapanan mum RSI 30'u asagidan yukari kestiyse, Telegram'a mesaj atar.
+Kapanmis son LOOKBACK mumun RSI(14) degerlerine bakar. Bir mumda RSI 30'un
+altindan (<=30) ustune (>30) gectiyse, Telegram'a mesaj atar.
+Bir calisma atlansa ya da gec kalsa bile kacan kesisimler gecmis mumlardan
+bulunur ("N mum once" etiketiyle, tek mesajda toplu gonderilir).
 Hacim (VA 20) kontrolu manuel yapilir.
 
 Gun sonu (18:xx calismasi) o gunun ozetini de gonderir.
@@ -36,6 +37,7 @@ ATR_MULT = 2.0              # ATR hedef carpani
 EXCLUDE = set()             # istemedigin hisseler, ornek: {"ISBTR"}
 NOTIFY_DOWN = True          # RSI 30'un altina inenleri de bildir (kapatmak icin False)
 MIN_ROWS = 50               # bundan az hisse gelirse veri bozuk say
+LOOKBACK = 9                # kesisim aranan kapanmis mum sayisi (~1 islem gunu)
 STALE_DAYS = 5              # kayitli RSI bu kadar gunden eskiyse kullanma
 KEEP_DAYS = 3               # bildirim kayitlarini kac gun sakla
 SCAN_HOURS = range(10, 19)  # beklenen tarama saatleri: 10:16 ... 18:16
@@ -46,21 +48,27 @@ TZ_TR = timezone(timedelta(hours=3))
 
 
 # ----------------------------------------------------------------------------
-# VERI  ([1] = bir onceki, yani kapanmis mum)
+# VERI  ([1] = son kapanmis mum, [2] = ondan bir onceki, ...)
 # ----------------------------------------------------------------------------
-def fetch() -> pd.DataFrame:
+def _columns(lookback: int) -> list:
+    cols = [
+        "name",
+        "RSI[1]|60",
+        "open[1]|60",
+        "close[1]|60",
+        "ATR[1]|60",
+        "BB.upper[1]|60",
+        "volume[1]|60",
+    ]
+    cols += [f"RSI[{k}]|60" for k in range(2, lookback + 1)]
+    return cols
+
+
+def _run_query(cols: list) -> pd.DataFrame:
     q = (
         Query()
         .set_markets("turkey")
-        .select(
-            "name",
-            "RSI[1]|60",
-            "open[1]|60",
-            "close[1]|60",
-            "ATR[1]|60",
-            "BB.upper[1]|60",
-            "volume[1]|60",
-        )
+        .select(*cols)
         .where(col("market_cap_basic") > MIN_MCAP)
         .order_by("market_cap_basic", ascending=False)
         .limit(500)
@@ -69,17 +77,26 @@ def fetch() -> pd.DataFrame:
     return df
 
 
+def fetch() -> pd.DataFrame:
+    try:
+        return _run_query(_columns(LOOKBACK))
+    except Exception as e:
+        # gecmis RSI sutunlari reddedilirse eski davranisa (sadece son mum) don
+        print("UYARI: gecmis RSI sutunlari alinamadi, sadece son mumla devam:", repr(e))
+        return _run_query(_columns(1))
+
+
 def prepare(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.rename(
-        columns={
-            "RSI[1]|60": "rsi",
-            "open[1]|60": "open",
-            "close[1]|60": "close",
-            "ATR[1]|60": "atr",
-            "BB.upper[1]|60": "bb_upper",
-            "volume[1]|60": "volume",
-        }
-    )
+    rename = {
+        "RSI[1]|60": "rsi",
+        "open[1]|60": "open",
+        "close[1]|60": "close",
+        "ATR[1]|60": "atr",
+        "BB.upper[1]|60": "bb_upper",
+        "volume[1]|60": "volume",
+    }
+    rename.update({f"RSI[{k}]|60": f"rsi{k}" for k in range(2, LOOKBACK + 1)})
+    d = df.rename(columns=rename)
     d = d.dropna(subset=["rsi", "close", "atr"])
     d = d[d["rsi"] > 0]                                   # verisi bozuk hisseleri ele
     d = d[~d["name"].isin(EXCLUDE)]
@@ -87,11 +104,36 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def find_crosses(d: pd.DataFrame, prev_rsi: dict) -> pd.DataFrame:
-    prev = d["name"].map(prev_rsi)                        # kayit yoksa NaN -> False
-    cross = d[(prev <= RSI_LEVEL) & (d["rsi"] > RSI_LEVEL)].copy()
-    cross["rsi_prev"] = prev[cross.index]
+    """
+    RSI esigi asagidan yukari kesenler.
+    ago = kesisimin kac mum once oldugu (1 = son kapanan mum).
+    Gecmis RSI sutunlari yoksa onceki calismanin kaydina gore (ago=1) bakar.
+    """
+    hist_cols = ["rsi"] + [f"rsi{k}" for k in range(2, LOOKBACK + 1) if f"rsi{k}" in d.columns]
+    rows = []  # (satir_no, ago, rsi_onceki, rsi_kesisim_mumu)
+
+    if len(hist_cols) > 1:
+        for i, rec in enumerate(d[hist_cols].itertuples(index=False)):
+            vals = list(rec)                              # vals[0] = RSI[1] (en yeni)
+            for k in range(1, len(vals)):                 # k = kesisim mumu (1 = en yeni)
+                cur, prv = vals[k - 1], vals[k]
+                if pd.notna(cur) and pd.notna(prv) and prv <= RSI_LEVEL < cur:
+                    # eski kesisim sonradan tekrar 30 altina indiyse gecerli sayma
+                    if k > 1 and not vals[0] > RSI_LEVEL:
+                        break
+                    rows.append((i, k, float(prv), float(cur)))
+                    break
+    else:
+        prev = d["name"].map(prev_rsi)                    # kayit yoksa NaN -> False
+        for i in d.index[(prev <= RSI_LEVEL) & (d["rsi"] > RSI_LEVEL)]:
+            rows.append((i, 1, float(prev[i]), float(d.at[i, "rsi"])))
+
+    cross = d.iloc[[r[0] for r in rows]].copy()
+    cross["ago"] = [r[1] for r in rows]
+    cross["rsi_prev"] = [r[2] for r in rows]
+    cross["rsi_at"] = [r[3] for r in rows]                # kesisim mumunun RSI'si
     cross["atr_hedef"] = cross["close"] + ATR_MULT * cross["atr"]
-    cross["key"] = cross["name"] + "|" + cross["rsi"].round(4).astype(str)
+    cross["key"] = cross["name"] + "|" + cross["rsi_at"].round(4).astype(str)
     return cross
 
 
@@ -181,6 +223,20 @@ def build_message(r) -> str:
     )
 
 
+def build_late_message(df: pd.DataFrame) -> str:
+    lines = [
+        f"🟠 <b>Geç yakalanan RSI {RSI_LEVEL:.0f} yukarı kesişimleri</b>",
+        "(önceki tarama atlandı/gecikti; giriş penceresi geçmiş olabilir, grafiğe bak)",
+        "",
+    ]
+    for r in df.sort_values("ago").itertuples():
+        lines.append(
+            f"• <b>{r.name}</b> — {r.ago} mum önce — RSI {r.rsi_prev:.1f} → {r.rsi_at:.1f} "
+            f"(şu an {r.rsi:.1f})"
+        )
+    return "\n".join(lines)
+
+
 def build_down_message(df: pd.DataFrame) -> str:
     lines = [f"🔻 <b>RSI {RSI_LEVEL:.0f}'un altına inenler</b> (1S mum kapandı)", ""]
     for r in df.itertuples():
@@ -197,8 +253,9 @@ def build_summary(day: dict, now: datetime) -> str:
     if crosses:
         lines.append(f"RSI 30'u yukarı kesen hisseler ({len(crosses)}):")
         for c in crosses:
+            geç = f" ({c['ago']} mum önce)" if c.get("ago", 1) > 1 else ""
             lines.append(
-                f"• <b>{c['name']}</b> — {c['time']} — RSI {c['rsi_prev']:.1f} → "
+                f"• <b>{c['name']}</b> — {c['time']}{geç} — RSI {c['rsi_prev']:.1f} → "
                 f"{c['rsi']:.1f} — {c['close']:.2f}"
             )
     else:
@@ -249,15 +306,18 @@ def main(now: datetime = None) -> None:
     sent = state.setdefault("sent", {})
     day = today_log(state, now)
     new = crosses[~crosses["key"].isin(sent)]
+    fresh = new[new["ago"] == 1]
+    late = new[new["ago"] > 1]
 
+    has_hist = "rsi2" in d.columns
     print(
-        f"[{now:%Y-%m-%d %H:%M}] taranan: {len(d)} | onceki kayit: {len(prev)} | "
-        f"kesisim: {len(crosses)} | yeni: {len(new)}"
+        f"[{now:%Y-%m-%d %H:%M}] taranan: {len(d)} | gecmis RSI: {'var' if has_hist else 'YOK'} | "
+        f"kesisim: {len(crosses)} | yeni: {len(new)} (taze {len(fresh)}, gec {len(late)})"
     )
-    if not prev:
-        print("  Not: onceki RSI kaydi yok (ilk calisma veya eski kayit), bu tur sinyal aranmadi.")
+    if NOTIFY_DOWN and not prev:
+        print("  Not: onceki RSI kaydi yok (ilk calisma veya eski kayit), asagi kesen aranmadi.")
 
-    for r in new.itertuples():
+    for r in fresh.itertuples():
         try:
             send(build_message(r))
             sent[r.key] = now.isoformat()
@@ -265,6 +325,7 @@ def main(now: datetime = None) -> None:
                 {
                     "name": r.name,
                     "time": f"{now:%H:%M}",
+                    "ago": 1,
                     "rsi_prev": float(r.rsi_prev),
                     "rsi": float(r.rsi),
                     "close": float(r.close),
@@ -273,6 +334,25 @@ def main(now: datetime = None) -> None:
             print("  gonderildi:", r.name)
         except Exception as e:  # gonderilemezse sonraki calismada tekrar denenir
             print("  GONDERILEMEDI:", r.name, repr(e))
+
+    if len(late):
+        try:
+            send(build_late_message(late))
+            for r in late.itertuples():
+                sent[r.key] = now.isoformat()
+                day["crosses"].append(
+                    {
+                        "name": r.name,
+                        "time": f"{now:%H:%M}",
+                        "ago": int(r.ago),
+                        "rsi_prev": float(r.rsi_prev),
+                        "rsi": float(r.rsi_at),
+                        "close": float(r.close),
+                    }
+                )
+            print(f"  gec yakalanan toplu mesaj gonderildi: {len(late)} hisse")
+        except Exception as e:
+            print("  GEC YAKALANAN MESAJ GONDERILEMEDI:", repr(e))
 
     if NOTIFY_DOWN:
         downs = find_down_crosses(d, prev)
