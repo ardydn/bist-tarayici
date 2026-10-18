@@ -1,10 +1,8 @@
 name: bist-rsi-tarayici
 
+# Zamanlama GitHub'da degil, cron-job.org'da (hafta ici 10:16-18:16, Europe/Istanbul).
+# cron-job.org bu workflow'u workflow_dispatch API'siyle tetikler.
 on:
-  schedule:
-    # Saatte bir, her saatin 16. dakikasinda (TradingView verisi ~15 dk gecikmeli).
-    # 07:16-15:16 UTC = 10:16-18:16 TSI, hafta ici
-    - cron: "16 7-15 * * 1-5"
   workflow_dispatch:
     inputs:
       test:
